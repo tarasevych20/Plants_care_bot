@@ -14,7 +14,7 @@ PLANT_ID_API_KEY = os.environ.get("PLANT_ID_API_KEY", "")
 TZ = ZoneInfo("Europe/Kyiv")
 
 DB_PATH = "plants.db"
-CARE_DAYS = [1, 4]  # 0=Пн ... 6=Нд  → 1=Вівторок, 4=Пʼятниця (макс 2 дні/тиждень)
+CARE_DAYS = [1, 4]  # 0=Mon ... 6=Sun  → 1=Tue, 4=Fri (max 2 care days/week)
 
 # ========= DB & MIGRATIONS =========
 def db():
@@ -22,7 +22,7 @@ def db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS plants(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER,                 -- мульти-користувачі (legacy: NULL)
+      user_id INTEGER,                 -- multi-user (legacy rows may be NULL)
       name TEXT NOT NULL,
       care TEXT NOT NULL,
       photo BLOB,
@@ -45,17 +45,16 @@ def db():
       created_at TEXT NOT NULL
     );
     """)
-    return c)
+    return c
 
 def migrate_legacy_rows_to_user(user_id: int):
-    """Якщо в базі є старі рядки без user_id, і для цього user_id ще немає рослин — привласнимо їх новому користувачу."""
+    """If legacy rows have NULL user_id and this user has none yet, assign them to this user."""
     c = db()
     have_user = c.execute("SELECT 1 FROM plants WHERE user_id=?", (user_id,)).fetchone()
     legacy = c.execute("SELECT 1 FROM plants WHERE user_id IS NULL").fetchone()
     if (not have_user) and legacy:
         c.execute("UPDATE plants SET user_id=? WHERE user_id IS NULL", (user_id,))
-        # Legacy tasks (на випадок старих): перенесемо теж
-        c.execute("UPDATE tasks SET user_id=? WHERE user_id IS NULL", (user_id,))
+        c.execute("UPDATE tasks  SET user_id=? WHERE user_id IS NULL", (user_id,))
         c.commit()
     c.close()
 
@@ -279,11 +278,11 @@ def today_tasks_markup_and_text(user_id: int):
 
     kinds_map = {'water':'Полив', 'feed':'Підживлення', 'mist':'Обприскування'}
     grouped = {'water': [], 'feed': [], 'mist': []}
+    kb_rows = []
+    lines = ["План на сьогодні 🌱"]
     for tid, kind, name in rows:
         grouped[kind].append((tid, name))
 
-    lines = ["План на сьогодні 🌱"]
-    kb_rows = []
     for kind in ['water','feed','mist']:
         if not grouped[kind]: continue
         lines.append(f"{kinds_map[kind]}:")
@@ -394,11 +393,10 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_home":
         await q.message.reply_text("Головне меню:", reply_markup=main_kb()); return
 
-    # Позначення виконано з картки (швидкі кнопки)
+    # Quick “done” buttons on plant card (creates instant task for today and closes it)
     if any(data.startswith(p) for p in ["done_water_", "done_feed_", "done_mist_"]):
         pid = int(data.split("_")[2])
         kind = 'water' if "water" in data else 'feed' if "feed" in data else 'mist'
-        # створимо "миттєве завдання" на сьогодні і закриємо його
         c = db()
         c.execute("""INSERT INTO tasks(user_id,plant_id,kind,due_date,status,created_at)
                      VALUES(?,?,?,?,?,?)""", (user_id, pid, kind, iso_today(), 'due', iso_today()))
@@ -412,7 +410,6 @@ SELECT_ADD_MODE, ADD_NAME, ADD_PHOTO_NEW, ADD_PHOTO_EXIST, ADD_PHOTO_PLANTID = r
 
 async def add_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; data = q.data
-    user_id = update.effective_user.id
     await q.answer()
     if data == "mode_name":
         await q.message.reply_text("Введи назву рослини одним повідомленням:"); return ADD_NAME
@@ -440,119 +437,127 @@ async def on_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_add_photo_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not update.message.photo:
-        await update.message.reply_text("Це не фото 🙃 Надішли зображення.");
-    # Обробка завдань
-    elif data.startswith("done_") or data.startswith("delay_") or data.startswith("skip_"):
-        parts = data.split("_")
-        action = parts[0]  # done/delay/skip
-        task_id = int(parts[1])
+        await update.message.reply_text("Це не фото 🙃 Надішли зображення."); return ADD_PHOTO_NEW
+    file = await update.message.photo[-1].get_file()
+    img = await file.download_as_bytearray()
+    name, ref_img = plantid_name_and_image(bytes(img))
+    name = name or "Нова рослина"
+    care, wi, fi, mi = care_and_intervals_for(name)
+    photo = ref_img or bytes(img)
+    c = db()
+    c.execute("""INSERT INTO plants(user_id,name,care,photo,water_int,feed_int,mist_int,
+                 last_watered,last_fed,last_misted)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (user_id, name, care, photo, wi, fi, mi, iso_today(), iso_today(), iso_today()))
+    c.commit(); c.close()
+    ensure_week_tasks_for_user(user_id)
+    await update.message.reply_text(f"Додав «{name}» ✅\nРозклад оновлено.", reply_markup=main_kb())
+    return ConversationHandler.END
 
-        cursor.execute("SELECT plant_name, action_type, due_date FROM tasks WHERE id = ? AND user_id = ?",
-                       (task_id, user_id))
-        task = cursor.fetchone()
-        if not task:
-            query.edit_message_text("Завдання не знайдено або вже виконане.")
-            return
+# ====== UPDATE PHOTO (manual & Plant.id) ======
+async def start_update_photo_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    pid = int(q.data.split("_")[1]); context.user_data["target_pid"] = pid
+    await q.message.reply_text("Надішли одне фото цієї рослини (jpg/png)."); return ADD_PHOTO_EXIST
 
-        plant_name, action_type, due_date = task
+async def on_add_photo_exist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not update.message.photo:
+        await update.message.reply_text("Це не фото 🙃 Надішли зображення."); return ADD_PHOTO_EXIST
+    pid = context.user_data.get("target_pid")
+    file = await update.message.photo[-1].get_file()
+    img = await file.download_as_bytearray()
+    c = db(); c.execute("UPDATE plants SET photo=? WHERE id=? AND user_id=?", (bytes(img), pid, user_id)); c.commit(); c.close()
+    await update.message.reply_text("Фото оновив ✅", reply_markup=main_kb())
+    return ConversationHandler.END
 
-        if action == "done":
-            # Оновлюємо останню дату дії
-            if action_type == "полив":
-                cursor.execute("UPDATE plants SET last_watering = ? WHERE user_id = ? AND name = ?",
-                               (datetime.now().date(), user_id, plant_name))
-            elif action_type == "підживлення":
-                cursor.execute("UPDATE plants SET last_fertilizing = ? WHERE user_id = ? AND name = ?",
-                               (datetime.now().date(), user_id, plant_name))
-            elif action_type == "обприскування":
-                cursor.execute("UPDATE plants SET last_misting = ? WHERE user_id = ? AND name = ?",
-                               (datetime.now().date(), user_id, plant_name))
-            conn.commit()
-            query.edit_message_text(f"✅ {plant_name} — {action_type} виконано!")
-            cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            conn.commit()
+async def start_update_photo_plantid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    pid = int(q.data.split("_")[1]); context.user_data["target_pid_pid"] = pid
+    await q.message.reply_text("Надішли фото цієї рослини — підтягну зображення з Plant.id."); return ADD_PHOTO_PLANTID
 
-        elif action == "delay":
-            # Переносимо на наступний доглядовий день
-            next_due = get_next_care_day(due_date)
-            cursor.execute("UPDATE tasks SET due_date = ? WHERE id = ?", (next_due, task_id))
-            conn.commit()
-            query.edit_message_text(f"⏩ {plant_name} — {action_type} відкладено до {next_due}")
+async def on_add_photo_plantid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not update.message.photo:
+        await update.message.reply_text("Це не фото 🙃 Надішли зображення."); return ADD_PHOTO_PLANTID
+    if not PLANT_ID_API_KEY:
+        await update.message.reply_text("PLANT_ID_API_KEY не заданий у Variables."); return ConversationHandler.END
+    pid = context.user_data.get("target_pid_pid")
+    file = await update.message.photo[-1].get_file()
+    img = await file.download_as_bytearray()
+    _, ref_img = plantid_name_and_image(bytes(img))
+    if not ref_img:
+        await update.message.reply_text("Не вдалося підтягнути фото з Plant.id. Залишаю без змін.")
+        return ConversationHandler.END
+    c = db(); c.execute("UPDATE plants SET photo=? WHERE id=? AND user_id=?", (ref_img, pid, user_id)); c.commit(); c.close()
+    await update.message.reply_text("Замінено фото на зображення з Plant.id ✅", reply_markup=main_kb())
+    return ConversationHandler.END
 
-        elif action == "skip":
-            query.edit_message_text(f"🚫 {plant_name} — {action_type} пропущено")
-            cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            conn.commit()
+# ====== TASK CALLBACKS (✅/⏩/🚫) ======
+async def on_task_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        _, tid_str, action = q.data.split(":")  # "task:<id>:done|defer|skip"
+        tid = int(tid_str)
+    except Exception:
+        await q.answer("Помилка callback"); return
+    if action == "done":
+        mark_task_done(tid); await q.answer("Готово ✅")
+    elif action == "defer":
+        move_task_to_next_care_day(tid); await q.answer("Перенесено ⏩")
+    elif action == "skip":
+        mark_task_skipped(tid); await q.answer("Пропущено 🚫")
+    # Refresh message
+    user_id = update.effective_user.id
+    text, kb = today_tasks_markup_and_text(user_id)
+    await q.message.edit_text(text, reply_markup=kb or main_kb())
 
-    elif data == "today_tasks":
-        tasks = get_tasks_for_today(user_id)
-        if not tasks:
-            query.edit_message_text("Сьогодні немає запланованих завдань 🌿")
-            return
+# ========= APP =========
+def build_app():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-        for t in tasks:
-            task_id, plant_name, action_type, due_date = t
-            keyboard = [
-                [InlineKeyboardButton("✅ Виконано", callback_data=f"done_{task_id}"),
-                 InlineKeyboardButton("⏩ Відкласти", callback_data=f"delay_{task_id}"),
-                 InlineKeyboardButton("🚫 Пропустити", callback_data=f"skip_{task_id}")]
-            ]
-            query.message.reply_text(f"{plant_name} — {action_type}", reply_markup=InlineKeyboardMarkup(keyboard))
+    # add plant conversation
+    add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_choose, pattern="^(mode_name|mode_photo|back_home)$")],
+        states={
+            SELECT_ADD_MODE: [CallbackQueryHandler(add_choose, pattern="^(mode_name|mode_photo|back_home)$")],
+            ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_add_name)],
+            ADD_PHOTO_NEW: [MessageHandler(filters.PHOTO, on_add_photo_new)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.effective_message.reply_text("Скасовано.", reply_markup=main_kb()))],
+        map_to_parent={ConversationHandler.END: ConversationHandler.END}
+    )
 
-    elif data == "week_schedule":
-        schedule = get_week_schedule(user_id)
-        query.edit_message_text(schedule)
+    # update photo manual
+    upd_photo_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_update_photo_manual, pattern=r"^addphoto_\d+$")],
+        states={ ADD_PHOTO_EXIST: [MessageHandler(filters.PHOTO, on_add_photo_exist)] },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.effective_message.reply_text("Скасовано.", reply_markup=main_kb()))],
+    )
 
+    # update photo via Plant.id
+    plantid_photo_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_update_photo_plantid, pattern=r"^plantidphoto_\d+$")],
+        states={ ADD_PHOTO_PLANTID: [MessageHandler(filters.PHOTO, on_add_photo_plantid)] },
+        fallbacks=[CommandHandler("cancel", lambda u,c: u.effective_message.reply_text("Скасовано.", reply_markup=main_kb()))],
+    )
 
-def get_next_care_day(current_date):
-    care_days = [1, 4]  # Вівторок і п'ятниця
-    current = datetime.strptime(current_date, "%Y-%m-%d").date()
-    for i in range(1, 8):
-        next_day = current + timedelta(days=i)
-        if next_day.weekday() in care_days:
-            return next_day
-    return current + timedelta(days=3)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(add_conv)
+    app.add_handler(upd_photo_conv)
+    app.add_handler(plantid_photo_conv)
+    app.add_handler(CallbackQueryHandler(on_task_action, pattern=r"^task:\d+:(done|defer|skip)$"))
+    app.add_handler(CallbackQueryHandler(router))  # catch-all router last
+    return app
 
+if __name__ == "__main__":
+    # start-up ping (to make sure deploy works)
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      json={"chat_id": os.environ.get("TELEGRAM_CHAT_ID"),
+                            "text": "✅ Бот оновлено. Доступні: «📋 План на сьогодні», «📅 Розклад на тиждень», «🌿 Мої рослини»"},
+                      timeout=10)
+    except Exception:
+        pass
 
-def get_tasks_for_today(user_id):
-    today = datetime.now().date()
-    cursor.execute("SELECT id, plant_name, action_type, due_date FROM tasks WHERE user_id = ? AND due_date = ?",
-                   (user_id, today))
-    return cursor.fetchall()
-
-
-def get_week_schedule(user_id):
-    today = datetime.now().date()
-    week_later = today + timedelta(days=7)
-    cursor.execute(
-        "SELECT plant_name, action_type, due_date FROM tasks WHERE user_id = ? AND due_date BETWEEN ? AND ? ORDER BY due_date",
-        (user_id, today, week_later))
-    tasks = cursor.fetchall()
-
-    if not tasks:
-        return "На тиждень немає запланованих завдань 🌿"
-
-    schedule = {}
-    for plant_name, action_type, due_date in tasks:
-        if due_date not in schedule:
-            schedule[due_date] = []
-        schedule[due_date].append(f"{plant_name} — {action_type}")
-
-    text = "📅 Розклад на тиждень:\n\n"
-    for date in sorted(schedule.keys()):
-        text += f"{date.strftime('%A, %d %B')}:\n"
-        for item in schedule[date]:
-            text += f"  - {item}\n"
-        text += "\n"
-
-    return text
-
-
-updater = Updater(TOKEN, use_context=True)
-dp = updater.dispatcher
-
-dp.add_handler(CommandHandler("start", start))
-dp.add_handler(CallbackQueryHandler(button_handler))
-
-updater.start_polling()
-updater.idle()
+    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
