@@ -69,6 +69,7 @@ def send(msg):
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=15)
 
 if __name__ == "__main__":
+    send("✅ Тест: бот успішно запущений на Railway і готовий працювати.")
     print("Bot started, waiting for 09:00 Europe/Kyiv…", flush=True)
     while True:
         now = dt.datetime.now(TZ)
