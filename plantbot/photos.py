@@ -24,3 +24,13 @@ def plantid_name_and_image(image_bytes: bytes):
         return (name, img)
     except Exception:
         return (None, None)
+# plantbot/photos.py  (додайте нижче існуючих імпортів/функцій)
+from telegram import Bot
+
+async def download_file_bytes(bot: Bot, file_id: str) -> bytes:
+    """
+    Скачує файл з Telegram і повертає bytes.
+    """
+    file = await bot.get_file(file_id)
+    bio = await file.download_as_bytearray()
+    return bytes(bio)
