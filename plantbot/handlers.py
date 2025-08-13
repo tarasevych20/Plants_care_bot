@@ -1,4 +1,14 @@
 # plantbot/handlers.py
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
+from telegram.ext import (
+    ConversationHandler, CallbackQueryHandler, MessageHandler, CommandHandler, ContextTypes, filters
+)
+
+from .photos import download_file_bytes
+from .resolvers import identify_from_image_bytes, parse_identify_response, search_name
+from .db import conn
+from .care import get_care_for  # якщо немає такої — нижче є фолбек
+
 from datetime import date
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -16,6 +26,23 @@ from .schedule import (
     ensure_week_tasks_for_user, week_overview_text, today_tasks_markup_and_text,
     mark_task_done, move_task_to_next_care_day, mark_task_skipped
 )
+ADD_CHOOSE, ADD_WAIT_PHOTO, ADD_WAIT_NAME, ADD_CONFIRM = range(4)
+
+def _base_care_text(name: str) -> str:
+    return ("Світло: яскраве розсіяне.\n"
+            "Полив: після підсихання верхнього шару ґрунту.\n"
+            "Підживлення: раз на 2–4 тижні в сезон.\n")
+
+def _insert_plant(user_id: int, name: str, care_text: str) -> int:
+    c = conn()
+    cur = c.cursor()
+    cur.execute(
+        "INSERT INTO plants(user_id, name, care, water_int, feed_int, mist_int) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, name, care_text, 7, 30, 0)
+    )
+    plant_id = cur.lastrowid
+    c.commit()
+    return plant_id
 
 # ---- Conversation states
 SELECT_ADD_MODE, ADD_NAME, ADD_PHOTO_NEW, ADD_PHOTO_EXIST, RENAME_WAIT = range(5)
@@ -127,6 +154,125 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.commit(); c.close()
         await q.message.reply_text("Видалив ✅", reply_markup=main_kb())
         return
+
+    async def add_plant_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Старт додавання — показує вибір способу."""
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Ввести назву вручну", callback_data="add_by_name")],
+        [InlineKeyboardButton("Фото (авто-розпізнавання)", callback_data="add_by_photo")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]
+    ])
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("Як додаємо рослину?", reply_markup=kb)
+    else:
+        await update.message.reply_text("Як додаємо рослину?", reply_markup=kb)
+    return ADD_CHOOSE
+
+async def add_choose_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Роутер вибору способу."""
+    q = update.callback_query
+    data = q.data if q else ""
+    if data == "add_by_photo":
+        await q.answer()
+        await q.edit_message_text("Надішли фото рослини одним повідомленням (jpg/png).")
+        return ADD_WAIT_PHOTO
+    elif data == "add_by_name":
+        await q.answer()
+        await q.edit_message_text("Введи назву рослини одним повідомленням:")
+        return ADD_WAIT_NAME
+    elif data == "back_to_menu":
+        await q.answer()
+        await q.edit_message_text("Окей, повернувся до меню.")
+        return ConversationHandler.END
+    else:
+        await q.answer()
+        return ADD_CHOOSE
+
+async def add_receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отримує фото, перевіряє Plant.id, просить підтвердження."""
+    if not update.message or not update.message.photo:
+        await update.message.reply_text("Треба саме фото 🌿")
+        return ADD_WAIT_PHOTO
+
+    img_id = update.message.photo[-1].file_id
+    img_bytes = await download_file_bytes(context.bot, img_id)
+
+    try:
+        resp = identify_from_image_bytes(img_bytes)
+    except Exception as e:
+        await update.message.reply_text(f"Помилка розпізнавання: {e}")
+        return ADD_WAIT_PHOTO
+
+    is_plant, conf, name, extra = parse_identify_response(resp)
+    if not is_plant or not name:
+        await update.message.reply_text("Схоже, на фото не рослина або не вдалося впізнати. Спробуй інше фото.")
+        return ADD_WAIT_PHOTO
+
+    context.user_data["pending_plant"] = {"name": name, "confidence": conf, "extra": extra}
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Додати", callback_data="confirm_add")],
+        [InlineKeyboardButton("❌ Скасувати", callback_data="cancel_add")]
+    ])
+    await update.message.reply_text(
+        f"Я думаю, що це **{name}** (впевненість {conf:.1f}%). Додати у список?",
+        reply_markup=kb
+    )
+    return ADD_CONFIRM
+
+async def add_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отримує текстову назву, перевіряє через name_search, просить підтвердження."""
+    query = (update.message.text or "").strip()
+    if not query:
+        await update.message.reply_text("Введи щось схоже на назву рослини 🙂")
+        return ADD_WAIT_NAME
+
+    ok, conf, name, extra = search_name(query)
+    if not ok or not name:
+        await update.message.reply_text("Не знайшов такої рослини. Спробуй іншу назву або додай за фото.")
+        return ADD_WAIT_NAME
+
+    context.user_data["pending_plant"] = {"name": name, "confidence": conf, "extra": extra}
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Додати", callback_data="confirm_add")],
+        [InlineKeyboardButton("❌ Скасувати", callback_data="cancel_add")]
+    ])
+    await update.message.reply_text(
+        f"Знайшов: **{name}** (впевненість {conf:.1f}%). Додати у список?",
+        reply_markup=kb
+    )
+    return ADD_CONFIRM
+
+async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = context.user_data.get("pending_plant") or {}
+    name = data.get("name")
+    if not name:
+        await q.edit_message_text("Немає даних для збереження 🤷‍♂️")
+        return ConversationHandler.END
+
+    # Формуємо текст догляду
+    try:
+        care_text = get_care_for(name)  # якщо є в твоєму care.py
+        if not care_text:
+            care_text = _base_care_text(name)
+    except Exception:
+        care_text = _base_care_text(name)
+
+    user_id = q.from_user.id
+    plant_id = _insert_plant(user_id, name, care_text)
+
+    await q.edit_message_text(f"Додав **{name}** ✅ (id: {plant_id})")
+    context.user_data.pop("pending_plant", None)
+    return ConversationHandler.END
+
+async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Скасовано ❌")
+    context.user_data.pop("pending_plant", None)
+    return ConversationHandler.END
 
     # ---- Додати рослину (меню)
     if data == "add_plant":
@@ -281,6 +427,34 @@ async def on_rename_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+
+def register_add_flow(app):
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("add", add_plant_entry),                # /add як швидкий вхід
+            CallbackQueryHandler(add_plant_entry, pattern="^add_plant$"),  # якщо у тебе є кнопка з таким callback_data
+        ],
+        states={
+            ADD_CHOOSE: [
+                CallbackQueryHandler(add_choose_router, pattern="^(add_by_photo|add_by_name|back_to_menu)$"),
+            ],
+            ADD_WAIT_PHOTO: [
+                MessageHandler(filters.PHOTO, add_receive_photo),
+            ],
+            ADD_WAIT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_receive_name),
+            ],
+            ADD_CONFIRM: [
+                CallbackQueryHandler(add_confirm, pattern="^confirm_add$"),
+                CallbackQueryHandler(add_cancel, pattern="^cancel_add$"),
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(add_cancel, pattern="^cancel_add$")],
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
+
+
 # =======================
 #  HELPERS / REGISTRATION
 # =======================
@@ -314,6 +488,9 @@ async def on_task_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
+    # ... інші реєстрації ...
+register_add_flow(app)
+
 
     # Конверсейшн додавання/редагування
     add_conv = ConversationHandler(
