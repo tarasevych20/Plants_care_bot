@@ -2,6 +2,25 @@
 import sqlite3
 from .config import DB_PATH
 
+# --- авто-міграція БД у volume ---
+import os, shutil
+from .config import DB_PATH
+
+LEGACY_PATHS = ["plants.db", "/app/plants.db"]  # де могла лежати стара БД
+
+def ensure_db_on_volume():
+    target = DB_PATH
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if os.path.exists(target):
+        return  # у volume вже є файл
+    for p in LEGACY_PATHS:
+        if os.path.exists(p):
+            shutil.copy2(p, target)  # переносимо старий файл
+            break
+
+ensure_db_on_volume()
+# --- кінець блоку авто-міграції ---
+
 def conn():
     c = sqlite3.connect(DB_PATH)
     c.execute("""
